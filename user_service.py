@@ -1,8 +1,18 @@
 import os
 import json
 import logging
+import sys
+import uuid
+from pathlib import Path
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
+
+# Add project root to Python path
+project_root = str(Path(__file__).parent)
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+from utils.response_formatter import success_response, error_response
 
 # Load environment variables from .env file
 load_dotenv()
@@ -49,6 +59,13 @@ class UserPreferences(BaseModel):
     push_enabled: bool = Field(..., description="If mobile push notifications are permitted.")
     quiet_hours_start: str = Field(..., description="Start time for quiet hours (e.g., '22:00').")
     quiet_hours_end: str = Field(..., description="End time for quiet hours (e.g., '08:00').")
+
+class UserCreate(BaseModel):
+    """Request model for creating a new user."""
+    email_address: str = Field(..., description="The user's primary email address.")
+    phone_number: str = Field(..., description="The user's primary phone number (E.164 format recommended).")
+    preferred_language: str = Field("en-US", description="The user's preferred language code (e.g., 'en-US').")
+    preferences: UserPreferences = Field(..., description="A map of notification preferences.")
 
 class UserContract(BaseModel):
     """
@@ -201,6 +218,100 @@ async def fetch_user_from_db(user_id: str) -> Optional[Dict[str, Any]]:
         )
 
 
+async def create_user_in_db(user_data: dict) -> dict:
+    """
+    Creates a new user in the database.
+    
+    Args:
+        user_data: Dictionary containing user data (email_address, phone_number, 
+                 preferred_language, preferences)
+                  
+    Returns:
+        dict: The created user data with generated user_id
+    """
+    if IS_MOCK_MODE:
+        # Generate a new user_id for mock mode
+        user_id = str(uuid.uuid4())
+        user = {
+            "user_id": user_id,
+            "email_address": user_data["email_address"],
+            "phone_number": user_data["phone_number"],
+            "preferred_language": user_data.get("preferred_language", "en-US"),
+            "preferences": user_data["preferences"]
+        }
+        MOCK_USERS[user_id] = user
+        return user
+        
+    if not HAS_DB_DRIVER or not DB_POOL:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database connection not available"
+        )
+    
+    try:
+        async with DB_POOL.acquire() as conn:
+            # Start a transaction
+            async with conn.transaction():
+                # Check if email already exists
+                existing = await conn.fetchrow(
+                    "SELECT user_id FROM users WHERE email_address = $1",
+                    user_data["email_address"]
+                )
+                
+                if existing:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"User with email '{user_data['email_address']}' already exists"
+                    )
+                
+                # Generate a new UUID for the user
+                user_id = str(uuid.uuid4())
+                
+                # Insert the new user
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO users (
+                        user_id,
+                        email_address, 
+                        phone_number, 
+                        preferred_language, 
+                        preferences
+                    ) VALUES ($1, $2, $3, $4, $5)
+                    RETURNING user_id, email_address, phone_number, 
+                             preferred_language, preferences
+                    """,
+                    user_id,
+                    user_data["email_address"],
+                    user_data["phone_number"],
+                    user_data.get("preferred_language", "en-US"),
+                    json.dumps(user_data["preferences"].dict() if hasattr(user_data["preferences"], "dict") 
+                              else user_data["preferences"])
+                )
+                
+                # Convert the record to a dictionary and ensure preferences is a dict
+                result = dict(row)
+                if isinstance(result.get('preferences'), str):
+                    try:
+                        result['preferences'] = json.loads(result['preferences'])
+                    except json.JSONDecodeError:
+                        logger.error(f"Failed to parse preferences JSON for new user {user_id}")
+                        result['preferences'] = {}
+                        
+                return result
+                
+    except asyncpg.UniqueViolationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A user with this email or phone number already exists"
+        )
+    except asyncpg.PostgresError as e:
+        logger.error(f"Database error creating user: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create user in database"
+        )
+
+
 # --- 3. FastAPI Application Setup ---
 
 app = FastAPI(
@@ -245,10 +356,13 @@ async def get_db_pool() -> asyncpg.Pool:
     
 # --- 4. Define the API Endpoint (Contract Implementation) ---
 
-@app.get("/")
+@app.get("/", include_in_schema=False)
 async def root():
     """Root endpoint to verify the service is running."""
-    return {"status": "User Service is running"}
+    return success_response(
+        data={"service": "User Service"},
+        message="User Service is running"
+    )
 
 @app.get(
     "/v1/health",
@@ -256,75 +370,43 @@ async def root():
     summary="Health check endpoint"
 )
 async def health_check():
-    """
-    Health check endpoint to verify the service is running and all dependencies are accessible.
-    Checks both PostgreSQL and Redis connections.
-    """
-    health_status = {
-        "status": "healthy",
-        "version": "1.0.0",
-        "services": {}
-    }
-    
+    """Health check endpoint to verify the service and its dependencies."""
     try:
-        # Check PostgreSQL connection
-        if not IS_MOCK_MODE and HAS_DB_DRIVER:
-            try:
-                pool = await get_db_pool()
-                if pool:
-                    async with pool.acquire() as conn:
-                        # Execute a simple query to verify database connection
-                        result = await conn.fetchval("SELECT 1")
-                        if result != 1:
-                            raise ValueError("Unexpected database response")
-                    health_status["services"]["postgresql"] = "connected"
-            except Exception as db_error:
-                logger.error(f"Database health check failed: {str(db_error)}")
-                health_status["services"]["postgresql"] = "unavailable"
-                health_status["status"] = "degraded"
-        else:
-            health_status["services"]["postgresql"] = "mock_mode"
-            
-        # Check Redis connection if available
-        try:
-            from redis_client import get_redis_client
-            redis = get_redis_client()
-            # Use the underlying client's ping which is synchronous
-            redis_pong = redis._client.ping()
-            if not redis_pong:
-                raise ValueError("Redis ping failed")
-            health_status["services"]["redis"] = "connected"
-        except ImportError:
-            logger.warning("Redis client not available")
-            health_status["services"]["redis"] = "not_configured"
-        except Exception as redis_error:
-            logger.error(f"Redis health check failed: {str(redis_error)}")
-            health_status["services"]["redis"] = "unavailable"
-            health_status["status"] = "degraded"
-            
-        # If any critical service is down, return 503
-        if health_status["status"] == "degraded":
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"status": "service_unavailable", "details": health_status}
-            )
-            
-        return health_status
+        health_data = {
+            "status": "healthy",
+            "version": "1.0.0",
+            "dependencies": {}
+        }
         
-    except HTTPException:
-        raise
+        # Check database connection if database is enabled
+        if HAS_DB_DRIVER and DB_POOL is not None:
+            try:
+                async with DB_POOL.acquire() as conn:
+                    await conn.fetchval('SELECT 1')
+                health_data["dependencies"]["database"] = "connected"
+            except Exception as db_error:
+                health_data["dependencies"]["database"] = f"error: {str(db_error)}"
+                raise db_error
+        else:
+            health_data["dependencies"]["database"] = "disabled"
+        
+        return success_response(
+            data=health_data,
+            message="Service is healthy"
+        )
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"status": "service_unavailable", "error": str(e)}
+        return error_response(
+            message="Service is unhealthy",
+            error=f"Health check failed: {str(e)}",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
         )
 
 @app.get(
-    "/v1/users/{user_id}", 
+    "/v1/users/{user_id}",
     response_model=UserContract,
     status_code=status.HTTP_200_OK,
-    summary="Retrieve User Profile and Notification Preferences (Internal Auth Required)"
+    summary="Get user profile and preferences"
 )
 async def get_user_profile(
     user_id: str,
@@ -336,43 +418,103 @@ async def get_user_profile(
     and requires the 'X-Internal-Secret' header for access control, 
     ensuring only the API Gateway can call it.
     
-    Raises 401 if the secret is invalid.
-    Raises 404 if the user ID is not found.
+    Returns 401 if the secret is invalid.
+    Returns 404 if the user ID is not found.
     """
-    
-    # 4.1 Internal Service Authentication Check
+    # Verify the internal secret
     if x_internal_secret != INTERNAL_API_SECRET:
-        logger.error(f"Authentication failed: Invalid X-Internal-Secret provided.")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid service authorization header. Access denied."
+        return error_response(
+            message="Unauthorized",
+            error="Invalid internal API secret",
+            status_code=status.HTTP_401_UNAUTHORIZED
         )
     
-    # 4.2 Data Retrieval
-    user_data = await fetch_user_from_db(user_id)
-    
-    if user_data is None:
-        logger.warning(f"User not found: {user_id}")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"User with ID '{user_id}' not found."
-        )
-    
-    # 4.3 Contract Validation
     try:
-        contract_data = UserContract(**user_data)
-        logger.info(f"Successfully retrieved and validated contract for user: {user_id}")
-        return contract_data
-    except Exception as e:
-        logger.error(f"Data validation failed for user {user_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal data structure error. Contract violation."
+        # Try to get user from database if available
+        if HAS_DB_DRIVER and DB_POOL is not None:
+            user_data = await fetch_user_from_db(user_id)
+        else:
+            # Fallback to mock data
+            if user_id not in MOCK_USERS:
+                return error_response(
+                    message=f"User with ID '{user_id}' not found.",
+                    status_code=status.HTTP_404_NOT_FOUND
+                )
+            user_data = MOCK_USERS[user_id]
+        
+        return success_response(
+            data=user_data,
+            message="User profile retrieved successfully"
         )
+        
+    except Exception as e:
+        error_msg = f"Error fetching user {user_id}: {str(e)}"
+        logger.error(error_msg)
+        return error_response(
+            message="Failed to retrieve user profile",
+            error=error_msg,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+@app.post(
+    "/v1/users",
+    status_code=status.HTTP_201_CREATED,
+    response_model=UserContract,
+    summary="Create a new user"
+)
+async def create_user(
+    user_data: UserCreate,
+    x_internal_secret: str = Header(..., alias="X-Internal-Secret")
+):
+    """
+    Creates a new user with the provided information.
+    
+    This endpoint is internal and requires the 'X-Internal-Secret' header for access control,
+    ensuring only the API Gateway can call it.
+    
+    Returns 201 with the created user data on success.
+    Returns 400 for invalid input data.
+    Returns 409 if a user with the email already exists.
+    """
+    # Verify the internal secret
+    if x_internal_secret != INTERNAL_API_SECRET:
+        return error_response(
+            message="Unauthorized",
+            error="Invalid internal API secret",
+            status_code=status.HTTP_401_UNAUTHORIZED
+        )
+    
+    try:
+        # Convert Pydantic model to dict for processing
+        user_dict = user_data.dict()
+        
+        # Create the user in the database
+        created_user = await create_user_in_db(user_dict)
+        
+        return success_response(
+            data=created_user,
+            message="User created successfully",
+            status_code=status.HTTP_201_CREATED
+        )
+        
+    except HTTPException as he:
+        # Re-raise HTTP exceptions with the same status code and detail
+        return error_response(
+            message=he.detail,
+            status_code=he.status_code
+        )
+    except Exception as e:
+        error_msg = f"Error creating user: {str(e)}"
+        logger.error(error_msg)
+        return error_response(
+            message="Failed to create user",
+            error=error_msg,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
 
 # --- How to run (Local Development) ---
 # 1. Install dependencies: pip install fastapi uvicorn pydantic asyncpg
-# 2. Run with your Neon URL and a secret: 
-#    NEON_DATABASE_URL="<YOUR_NEON_URI>" INTERNAL_API_SECRET="<YOUR_SECRET>" uvicorn user_service:app --reload 
+# 2. Run with your Neon URL and a secret:
 # 3. Or run in mock mode (no DB required):
 #    uvicorn user_service:app --reload

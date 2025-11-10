@@ -1,13 +1,19 @@
 import os
 import logging
 import json
+import sys
+from pathlib import Path
 from typing import Dict, Any, Optional
+
+# Add project root to Python path
+project_root = str(Path(__file__).parent.parent)
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
 from fastapi import FastAPI, HTTPException, status, Header
 from pydantic import BaseModel, Field
 from redis_client import get_redis_client
-
-
+from utils.response_formatter import success_response, error_response
 
 # --- PYTHON-DOTENV IMPORT AND LOAD ---
 try:
@@ -423,7 +429,6 @@ async def shutdown_event():
             DB_POOL = None
 
 
-# --- 4. Define the API Endpoints ---
 
 @app.get(
     "/v1/health",
@@ -484,20 +489,25 @@ async def health_check():
             
         # If any critical service is down, return 503
         if health_status["status"] == "degraded":
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"status": "service_unavailable", "details": health_status}
+            return error_response(
+                message="Service unavailable",
+                error="One or more dependencies are unavailable",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE
             )
             
-        return health_status
+        return success_response(
+            data=health_status,
+            message="Service is running and all dependencies are accessible"
+        )
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"status": "service_unavailable", "error": str(e)}
+        return error_response(
+            message="Failed to perform health check",
+            error=str(e),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
 @app.post(
@@ -516,36 +526,46 @@ async def render_template_with_payload(
     """
     # Verify service-to-service authentication
     if x_internal_secret != INTERNAL_API_SECRET:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid or missing internal API secret"
+        return error_response(
+            message="Unauthorized",
+            error="Invalid or missing internal API secret",
+            status_code=status.HTTP_401_UNAUTHORIZED
         )
     
     # Get the template (will raise 404 if not found)
     # The fetch_template_from_db function now includes Redis caching
-    template = await fetch_template_from_db(request.template_key)
-    
-    # Render each part of the template with the provided data
     try:
-        rendered = {
-            "subject": render_content(template["subject"], request.message_data),
-            "body": render_content(template["body"], request.message_data),
-            "html_body": render_content(template["html_body"], request.message_data)
-        }
-        return RenderedContract(**rendered)
+        template = await fetch_template_from_db(request.template_key)
         
-    except KeyError as e:
-        # Handle missing template variables
-        missing_var = str(e).strip("'")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Missing required template variable: {missing_var}"
+        # Render each part of the template with the provided data
+        rendered_subject = render_content(template["subject"], request.message_data)
+        rendered_body = render_content(template["body"], request.message_data)
+        rendered_html = render_content(template["html_body"], request.message_data)
+        
+        rendered_content = {
+            "subject": rendered_subject,
+            "body": rendered_body,
+            "html_body": rendered_html
+        }
+        
+        return success_response(
+            data=rendered_content,
+            message="Template rendered successfully"
+        )
+        
+    except HTTPException as he:
+        # Re-raise HTTP exceptions (like 404) with our standard format
+        return error_response(
+            message=he.detail,
+            status_code=he.status_code
         )
     except Exception as e:
-        logger.error(f"Error rendering template {request.template_key}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred while rendering the template: {str(e)}"
+        error_msg = f"Error rendering template {request.template_key}: {str(e)}"
+        logger.error(error_msg)
+        return error_response(
+            message="Failed to render template",
+            error=error_msg,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
 
@@ -567,37 +587,67 @@ async def create_template(
     """
     # Verify service-to-service authentication
     if x_internal_secret != INTERNAL_API_SECRET:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid or missing internal API secret"
+        return error_response(
+            message="Unauthorized",
+            error="Invalid or missing internal API secret",
+            status_code=status.HTTP_401_UNAUTHORIZED
         )
     
-    # Check if template already exists
     try:
-        existing = await fetch_template_from_db(request.template_key)
-        if existing:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Template with key '{request.template_key}' already exists."
-            )
-    except HTTPException as e:
-        if e.status_code != status.HTTP_404_NOT_FOUND:
-            raise e
-    
-    # Add to database or mock storage
-    template_data = {
-        "subject": request.subject,
-        "body": request.body,
-        "html_body": request.html_body
-    }
-    
-    # Invalidate cache for this template
-    redis = get_redis_client()
-    cache_key = f"template:{request.template_key}"
-    try:
-        await redis.delete(cache_key)
+        # Convert the Pydantic model to a dict for storage
+        template_data = {
+            "subject": request.subject,
+            "body": request.body,
+            "html_body": request.html_body
+        }
+        
+        # Check if template already exists
+        try:
+            existing = await fetch_template_from_db(request.template_key)
+            if existing:
+                return error_response(
+                    message="Template already exists",
+                    error=f"Template with key '{request.template_key}' already exists.",
+                    status_code=status.HTTP_409_CONFLICT
+                )
+        except HTTPException as e:
+            if e.status_code != status.HTTP_404_NOT_FOUND:
+                return error_response(
+                    message=e.detail,
+                    status_code=e.status_code
+                )
+        
+        # Add to database or mock storage
+        await add_template_to_db(request.template_key, template_data)
+        
+        # Invalidate cache for this template
+        redis = get_redis_client()
+        cache_key = f"template:{request.template_key}"
+        try:
+            await redis.delete(cache_key)
+        except Exception as e:
+            logger.warning(f"Failed to invalidate cache for {request.template_key}: {e}")
+        
+        return success_response(
+            data={"template_key": request.template_key},
+            message=f"Template '{request.template_key}' created successfully.",
+            status_code=status.HTTP_201_CREATED
+        )
+        
+    except HTTPException as he:
+        # Convert HTTP exceptions to our standard format
+        return error_response(
+            message=he.detail,
+            status_code=he.status_code
+        )
     except Exception as e:
-        logger.warning(f"Failed to invalidate cache for {request.template_key}: {e}")
+        error_msg = f"Error creating template {request.template_key}: {str(e)}"
+        logger.error(error_msg)
+        return error_response(
+            message="Failed to create template",
+            error=error_msg,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
     
     await add_template_to_db(request.template_key, template_data)
     

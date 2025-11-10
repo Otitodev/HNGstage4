@@ -3,8 +3,9 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from dotenv import load_dotenv
+from utils.response_formatter import success_response, error_response
 
 # Add project root to Python path
 project_root = str(Path(__file__).parent.parent)
@@ -95,6 +96,14 @@ def publish_to_queue(payload: Dict[str, Any], queue_name: str = "notifications")
 # --- FastAPI Application Setup ---
 app = FastAPI(title="API Gateway (Notification Orchestrator)")
 
+# --- Root Endpoint ---
+@app.get("/", include_in_schema=False)
+async def root():
+    """Root endpoint to verify the service is running."""
+    return success_response(
+        data={"service": "API Gateway"},
+        message="API Gateway is running"
+    )
 
 # --- Main Orchestration Endpoint (UPDATED) ---
 
@@ -104,8 +113,21 @@ def call_user_service(user_id: str, headers: Dict[str, str]) -> Dict[str, Any]:
     """Protected call to the User Service."""
     user_url = f"{USER_SERVICE_URL}/v1/users/{user_id}"
     user_response = requests.get(user_url, headers=headers, timeout=5)
-    user_response.raise_for_status() # Raises HTTPError for 4xx/5xx
-    return user_response.json()
+    user_response.raise_for_status()  # Raises HTTPError for 4xx/5xx
+    
+    # Parse the response
+    response_data = user_response.json()
+    
+    # If the response is already in our standard format, return it as-is
+    if isinstance(response_data, dict) and 'data' in response_data:
+        return response_data
+        
+    # Otherwise, wrap it in the standard format
+    return {
+        "success": True,
+        "data": response_data,
+        "message": "User data retrieved successfully"
+    }
 
 # Helper function to encapsulate Template Service call under the breaker
 @template_breaker
@@ -130,30 +152,57 @@ def send_notification(request: NotificationRequest):
 
     # --- Step 1: Fetch User Profile and Preferences (Protected) ---
     try:
-        user_data = call_user_service(request.user_id, headers)
+        response = call_user_service(request.user_id, headers)
+        
+        # Check if the response has the expected structure
+        if not isinstance(response, dict):
+            raise ValueError("Invalid response format from User Service")
+            
+        # Handle the standardized response format
+        if not response.get("success", False):
+            return error_response(
+                message=response.get("message", "User Service returned an error"),
+                error=response.get("error", "Unknown error"),
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+            
+        # Extract user data from the response
+        user_data = response.get("data", {})
+        if not user_data:
+            raise ValueError("No user data found in response")
         
     except pybreaker.CircuitBreakerError:
-        logger.error("User Service Circuit Breaker is OPEN. Failing fast.")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="User Service is temporarily unavailable (Circuit Breaker OPEN). Try again later."
+        error_msg = "User Service is temporarily unavailable (Circuit Breaker OPEN). Try again later."
+        logger.error(error_msg)
+        return error_response(
+            message=error_msg,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
         )
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"User with ID '{request.user_id}' not found."
+            return error_response(
+                message=f"User with ID '{request.user_id}' not found.",
+                status_code=status.HTTP_404_NOT_FOUND
             )
         logger.error(f"User Service failed (Status: {e.response.status_code}): {e.response.text}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="User Service returned an unexpected error."
+        return error_response(
+            message="User Service returned an unexpected error.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
         )
     except requests.exceptions.ConnectionError:
         # Connection failures automatically trip the breaker
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="User Service is unreachable."
+        error_msg = "User Service is unreachable."
+        logger.error(error_msg)
+        return error_response(
+            message=error_msg,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+    except (ValueError, KeyError) as e:
+        logger.error(f"Error processing User Service response: {str(e)}")
+        return error_response(
+            message="Failed to process user data",
+            error=str(e),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
     # --- Step 2: Render Template Content (Protected) ---
@@ -166,40 +215,76 @@ def send_notification(request: NotificationRequest):
         rendered_content = call_template_service(template_payload, headers)
         
     except pybreaker.CircuitBreakerError:
-        logger.error("Template Service Circuit Breaker is OPEN. Failing fast.")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Template Service is temporarily unavailable (Circuit Breaker OPEN). Try again later."
+        error_msg = "Template Service is temporarily unavailable (Circuit Breaker OPEN). Try again later."
+        logger.error(error_msg)
+        return error_response(
+            message=error_msg,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
         )
     except requests.exceptions.HTTPError as e:
         if e.response.status_code in (404, 400):
-            raise HTTPException(
-                status_code=e.response.status_code,
-                detail=e.response.json().get("detail", "Template rendering failed due to bad input.")
+            return error_response(
+                message=e.response.json().get("detail", "Template rendering failed due to bad input."),
+                status_code=e.response.status_code
             )
         logger.error(f"Template Service failed (Status: {e.response.status_code}): {e.response.text}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Template Service returned an unexpected error."
+        return error_response(
+            message="Template Service returned an unexpected error.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
         )
     except requests.exceptions.ConnectionError:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Template Service is unreachable."
+        error_msg = "Template Service is unreachable."
+        logger.error(error_msg)
+        return error_response(
+            message=error_msg,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
         )
 
     # --- Step 3 & 4: Orchestrate Final Payload and Publish ---
-    final_payload = {
-        "user_id": user_data["user_id"],
-        "delivery_targets": {"email": user_data["email_address"], "phone": user_data["phone_number"]},
-        "user_preferences": user_data["preferences"],
-        "rendered_content": rendered_content,
-        "metadata": {"template_key": request.template_key, "preferred_language": user_data["preferred_language"]}
-    }
+    try:
+        final_payload = {
+            "user_id": user_data.get("user_id") or user_data.get("id"),
+            "delivery_targets": {
+                "email": user_data.get("email") or user_data.get("email_address"),
+                "phone": user_data.get("phone") or user_data.get("phone_number", "")
+            },
+            "user_preferences": user_data.get("preferences", {}),
+            "rendered_content": rendered_content,
+            "metadata": {
+                "template_key": request.template_key,
+                "preferred_language": user_data.get("preferred_language", "en")
+            }
+        }
+        
+        # Validate required fields
+        if not final_payload["user_id"]:
+            raise ValueError("User ID is missing in the response")
+            
+        if not final_payload["delivery_targets"]["email"] and not final_payload["delivery_targets"]["phone"]:
+            logger.warning(f"No valid delivery targets found for user {final_payload['user_id']}")
+            
+    except KeyError as e:
+        logger.error(f"Missing required user data field: {str(e)}")
+        return error_response(
+            message="Incomplete user data received",
+            error=f"Missing required field: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
     
-    publish_to_queue(final_payload, queue_name="notifications")
-
-    return {"message": "Notification successfully queued for delivery."}
+    try:
+        publish_to_queue(final_payload, queue_name="notifications")
+        return success_response(
+            data={"notification_id": final_payload.get("user_id")},
+            message="Notification successfully queued for delivery.",
+            status_code=status.HTTP_202_ACCEPTED
+        )
+    except Exception as e:
+        logger.error(f"Failed to publish to queue: {str(e)}")
+        return error_response(
+            message="Failed to queue notification",
+            error=str(e),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 # --- How to run (Local Development) ---
 # 1. Install dependencies: pip install fastapi uvicorn pydantic requests pika python-dotenv

@@ -1,218 +1,196 @@
-# Template Service
+Notification System Microservices
 
-A FastAPI-based microservice for managing and rendering notification templates with support for both plain text and HTML content.
+A distributed notification system designed for resilience and scalability, built with FastAPI, Redis, and RabbitMQ.
 
-## Features
+This system is composed of three core microservices that handle orchestration, user data, and dynamic content rendering.
 
-- Create and manage email/notification templates
-- Render templates with dynamic data
-- Support for both plain text and HTML content
-- Built-in mock mode for development and testing
-- PostgreSQL database integration with connection pooling
-- Comprehensive error handling and validation
+📦 Services Overview
 
-## Prerequisites
+1. API Gateway (api_gateway.py)
 
-- Python 3.8+
-- PostgreSQL (optional, mock mode available)
-- pip (Python package manager)
+The main entry point that orchestrates the entire notification flow, making synchronous calls to downstream services and handling asynchronous queuing.
 
-## Installation
+Key Features:
 
-1. Clone the repository:
-   ```bash
-   git clone <repository-url>
-   cd template-service
-   ```
+Request validation and routing
 
-2. Create and activate a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+Circuit breaker pattern for fault tolerance against service failure
 
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+Message queue integration (RabbitMQ)
 
-4. Set up environment variables:
-   Create a `.env` file in the root directory with the following variables:
-   ```
-   INTERNAL_API_SECRET=your-secret-key
-   NEON_DATABASE_URL=postgresql://user:password@localhost:5432/yourdb
-   ```
+Service discovery and load balancing
 
-## Running the Service
+2. User Service (USER/user_service.py)
 
-### Development Mode (with Mock Database)
-```bash
-uvicorn template_service:app --reload
-```
+Manages user data and notification preferences, utilizing a dedicated PostgreSQL database.
 
-### Production Mode
-```bash
-uvicorn template_service:app --host 0.0.0.0 --port 8000
-```
+Key Features:
 
-## API Endpoints
+User profile and preference management
 
-### 1. Create a New Template
+Enhanced multi-language support
 
-**Endpoint:** `POST /v1/templates`
+Database integration with connection pooling (Neon)
 
-**Headers:**
-- `X-Internal-Secret`: Your secret key
+Enhanced /health checks for database and Redis status
 
-**Request Body:**
-```json
+3. Template Service (TEMPLATE/template_service.py)
+
+Handles template storage, versioning, and dynamic content rendering using data provided by the API Gateway.
+
+Key Features:
+
+Template storage and versioning
+
+Dynamic content rendering (Jinja2/string interpolation)
+
+Caching template content with Redis for performance
+
+Enhanced /health checks for database and Redis status
+
+🚀 Prerequisites (Local Development)
+
+Python 3.8+
+
+Redis Server (e.g., via Upstash or local Docker)
+
+RabbitMQ Server (e.g., via Render or local Docker)
+
+PostgreSQL (e.g., via Neon or local Docker)
+
+pip (Python package manager)
+
+🔧 Installation
+
+Clone the repository:
+
+git clone <repository-url>
+cd HNGstage4
+
+
+Create and activate a virtual environment:
+
+python -m venv venv
+# On Unix or MacOS:
+source venv/bin/activate
+
+
+Install dependencies:
+
+pip install -r requirements.txt
+
+
+Set up environment variables:
+Create a .env file in the root directory. Note the use of separate REDIS_HOST and REDIS_PORT.
+
+# API Gateway Security
+INTERNAL_API_SECRET=your-super-secret-key-change-this
+
+# Redis (Upstash) Configuration
+REDIS_HOST=localhost 
+REDIS_PORT=6379 
+
+# RabbitMQ (Render) Configuration
+RABBITMQ_URL=amqp://guest:guest@localhost:5672/
+
+# Service Discovery URLs (Change to Leapcell/Render internal domains in production)
+USER_SERVICE_URL=http://localhost:8001
+TEMPLATE_SERVICE_URL=http://localhost:8002
+
+# Database (Neon) Configuration - Used by User and Template Services
+NEON_DATABASE_URL=postgresql://user:password@localhost:5432/yourdb
+
+
+🏃‍♂️ Running the Services (Local)
+
+1. Start External Dependencies
+
+Start your local PostgreSQL, Redis, and RabbitMQ containers/servers.
+
+2. Start the Services
+
+API Gateway (Port 8000)
+
+uvicorn api_gateway:app --port 8000 --reload
+
+
+User Service (Port 8001)
+
+uvicorn USER.user_service:app --port 8001 --reload
+
+
+Template Service (Port 8002)
+
+uvicorn TEMPLATE.template_service:app --port 8002 --reload
+
+
+🌐 API Endpoints & Standards
+
+System-Wide API Standard
+
+All synchronous API responses across the Gateway, User, and Template services adhere to this uniform structure to ensure consistency and facilitate automated consumption.
+
 {
-    "template_key": "TEMPLATE_KEY",
-    "subject": "Your subject with {variable}",
-    "body": "Hello {name}, this is a plain text template.",
-    "html_body": "<h1>Hello {name}</h1><p>This is an HTML template.</p>"
+  "success": boolean,
+  "data"?: T,
+  "error"?: string,
+  "message": string,
+  "meta": {
+    "total": number,
+    "limit": number,
+    "page": number,
+    "total_pages": number,
+    "has_next": boolean,
+    "has_previous": boolean
+  }
 }
-```
 
-**Response:**
-```json
-{
-    "message": "Template 'TEMPLATE_KEY' created successfully."
-}
-```
 
-### 2. Render a Template
+API Gateway Endpoints
 
-**Endpoint:** `POST /v1/templates/render`
+POST /v1/notifications - Send a notification request, which is queued for async processing.
 
-**Headers:**
-- `X-Internal-Secret`: Your secret key
+GET /v1/health - Health check (confirms dependencies are running).
 
-**Request Body:**
-```json
-{
-    "template_key": "TEMPLATE_KEY",
-    "message_data": {
-        "name": "John",
-        "variable": "value"
-    }
-}
-```
+User Service Endpoints
 
-**Response:**
-```json
-{
-    "subject": "Your subject with value",
-    "body": "Hello John, this is a plain text template.",
-    "html_body": "<h1>Hello John</h1><p>This is an HTML template.</p>"
-}
-```
+GET /v1/users/{user_id} - Get user profile and preferences.
 
-## Available Templates
+GET /v1/health - Enhanced health check (DB/Redis status).
 
-The service comes with the following pre-defined templates:
+Template Service Endpoints
 
-### 1. Order Confirmation
-- **Key:** `ORDER_CONFIRMATION`
-- **Description:** Sent when a customer places an order
-- **Variables:**
-  - `{order_id}` - The order ID
-  - `{customer_name}` - Customer's name
-  - `{tracking_link}` - Link to track the order
+POST /v1/templates/render - Render a template with dynamic data.
 
-### 2. Password Reset
-- **Key:** `PASSWORD_RESET`
-- **Description:** Sent when a user requests a password reset
-- **Variables:**
-  - `{app_name}` - Your application name
-  - `{customer_name}` - Customer's name
-  - `{reset_link}` - Password reset link
+POST /v1/templates - Create a new template.
 
-### 3. Shipping Update
-- **Key:** `SHIPPING_UPDATE`
-- **Description:** Sent when there's an update to an order's shipping status
-- **Variables:**
-  - `{order_id}` - The order ID
-  - `{carrier}` - Shipping carrier name
-  - `{tracking_number}` - Tracking number
-  - `{tracking_link}` - Link to track the package
+GET /v1/health - Enhanced health check (DB/Redis status).
 
-### 4. Invoice Paid
-- **Key:** `INVOICE_PAID`
-- **Description:** Sent when an invoice is paid
-- **Variables:**
-  - `{invoice_id}` - The invoice ID
-  - `{amount}` - Amount paid
-  - `{receipt_link}` - Link to download the receipt
+🔄 Dependencies
 
-### 5. Welcome New User
-- **Key:** `WELCOME_NEW_USER`
-- **Description:** Sent to new users after signup
-- **Variables:**
-  - `{app_name}` - Your application name
-  - `{customer_name}` - New user's name
-  - `{profile_link}` - Link to complete profile
+FastAPI - High-performance web framework
 
-### 6. Weekly Digest
-- **Key:** `WEEKLY_DIGEST`
-- **Description:** Weekly summary of user activity
-- **Variables:**
-  - `{app_name}` - Your application name
-  - `{new_updates}` - Number of new updates
-  - `{digest_link}` - Link to view full digest
+Pydantic - Data validation
 
-### 7. Account Locked
-- **Key:** `ACCOUNT_LOCKED`
-- **Description:** Sent when an account is locked for security reasons
-- **Variables:**
-  - `{app_name}` - Your application name
-  - `{reason}` - Reason for account lock
-  - `{support_number}` - Support contact number
+pybreaker - Circuit breaker implementation (Crucial for API Gateway resilience)
 
-### 8. Promotion - Flash Sale
-- **Key:** `PROMOTION_FLASH_SALE`
-- **Description:** Promotional email for flash sales
-- **Variables:**
-  - `{discount_percent}` - Discount percentage
-  - `{promo_code}` - Promo code to use
-  - `{sale_link}` - Link to the sale
+pika - RabbitMQ client for publishing messages
 
-### 9. Support Ticket Update
-- **Key:** `SUPPORT_TICKET_UPDATE`
-- **Description:** Notification about support ticket updates
-- **Variables:**
-  - `{ticket_id}` - Support ticket ID
-  - `{customer_name}` - Customer's name
-  - `{status}` - Current status of the ticket
-  - `{ticket_link}` - Link to view the ticket
+redis - Redis client (Used for caching and Idempotency checks)
 
-### 10. Low Stock Alert
-- **Key:** `LOW_STOCK_ALERT`
-- **Description:** Notification about low stock levels
-- **Variables:**
-  - `{product_name}` - Name of the product
-  - `{stock_count}` - Remaining stock count
-  - `{product_link}` - Link to the product page
+asyncpg - Async PostgreSQL client (Database connection to Neon)
 
-## Error Handling
+python-dotenv - Environment variable management
 
-The API returns appropriate HTTP status codes along with JSON error messages:
+requests - Synchronous HTTP client (API Gateway for internal communication)
 
-- `200 OK`: Request was successful
-- `400 Bad Request`: Invalid request data
-- `401 Unauthorized`: Missing or invalid API key
-- `404 Not Found`: Template not found
-- `409 Conflict`: Template with the same key already exists
-- `500 Internal Server Error`: Server error
+🧪 Testing
 
-## Testing
+Run the test suite:
 
-Run the test suite with:
+pytest
 
-```bash
-pytest test_template_service.py -v
-```
 
-## License
+📝 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the LICENSE file for details.
