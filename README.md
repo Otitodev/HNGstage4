@@ -1,52 +1,184 @@
-Notification System Microservices
+# Notification System Microservices
 
-A distributed notification system designed for resilience and scalability, built with FastAPI, Redis, and RabbitMQ.
+A distributed notification system designed for resilience and scalability, built with FastAPI, Redis, and RabbitMQ. This system is composed of three core microservices that handle orchestration, user data, and dynamic content rendering.
 
-This system is composed of three core microservices that handle orchestration, user data, and dynamic content rendering.
+## 🚀 Features
 
-📦 Services Overview
+- **Resilient Architecture**: Circuit breakers, retries, and dead-letter queues
+- **High Performance**: Redis caching and async database operations
+- **Scalable**: Microservices architecture with message queuing
+- **Developer Friendly**: Well-documented REST APIs with OpenAPI documentation
+- **Observable**: Comprehensive logging and health checks
 
-1. API Gateway (api_gateway.py)
+## 📦 Services Overview
 
-The main entry point that orchestrates the entire notification flow, making synchronous calls to downstream services and handling asynchronous queuing.
+### 1. API Gateway (`api_gateway.py`)
 
-Key Features:
+The main entry point that orchestrates the notification flow, handling request validation, service coordination, and message queuing.
 
-Request validation and routing
+**Key Features:**
+- Request validation and routing
+- Circuit breaker pattern for fault tolerance
+- Message queue integration (RabbitMQ)
+- Service discovery and load balancing
+- Synchronous and asynchronous processing
 
-Circuit breaker pattern for fault tolerance against service failure
+### 2. User Service (`user_service.py`)
 
-Message queue integration (RabbitMQ)
+Manages user data and notification preferences with PostgreSQL database integration.
 
-Service discovery and load balancing
+**Key Features:**
+- User profile management
+- Notification preferences
+- Multi-language support
+- Database connection pooling
+- Health monitoring
 
-2. User Service (USER/user_service.py)
+### 3. Template Service (`template_service.py`)
 
-Manages user data and notification preferences, utilizing a dedicated PostgreSQL database.
+Handles template storage, versioning, and dynamic content rendering.
 
-Key Features:
+**Key Features:**
+- Template management (CRUD)
+- Dynamic content rendering
+- Redis caching
+- Template versioning
+- Health monitoring
 
-User profile and preference management
+## 📚 API Endpoints
 
-Enhanced multi-language support
+### API Gateway
+- `POST /notify` - Send a notification
+  ```json
+  {
+    "user_id": "uuid-here",
+    "template_key": "WELCOME_EMAIL",
+    "message_data": {"name": "John", "verification_link": "https://..."}
+  }
+  ```
 
-Database integration with connection pooling (Neon)
+### User Service
+- `GET /users/{user_id}` - Get user profile
+- `POST /users` - Create new user
+  ```json
+  {
+    "email_address": "user@example.com",
+    "phone_number": "+1234567890",
+    "preferred_language": "en-US",
+    "preferences": {
+      "email_enabled": true,
+      "push_enabled": true,
+      "quiet_hours_start": "22:00",
+      "quiet_hours_end": "08:00"
+    }
+  }
+  ```
 
-Enhanced /health checks for database and Redis status
+### Template Service
+- `POST /templates` - Create new template
+  ```json
+  {
+    "template_key": "WELCOME_EMAIL",
+    "subject": "Welcome, {name}!",
+    "body": "Hello {name}, welcome to our service!",
+    "html_body": "<h1>Welcome, {name}!</h1><p>Thank you for joining us!</p>"
+  }
+  ```
+- `POST /templates/render` - Render template with data
+  ```json
+  {
+    "template_key": "WELCOME_EMAIL",
+    "message_data": {"name": "John"}
+  }
+  ```
 
-3. Template Service (TEMPLATE/template_service.py)
+## 🛠️ Setup & Installation
 
-Handles template storage, versioning, and dynamic content rendering using data provided by the API Gateway.
+### Prerequisites
+- Python 3.8+
+- RabbitMQ
+- Redis
+- PostgreSQL (Neon)
 
-Key Features:
+### Environment Variables
+Create a `.env` file with the following variables:
+```
+# API Gateway
+INTERNAL_API_SECRET=your-secret-key
+USER_SERVICE_URL=http://localhost:8001
+TEMPLATE_SERVICE_URL=http://localhost:8002
+RABBITMQ_URL=amqp://guest:guest@localhost:5672/
 
-Template storage and versioning
+# User Service
+NEON_DATABASE_URL=postgresql://user:pass@host/db
 
-Dynamic content rendering (Jinja2/string interpolation)
+# Template Service
+REDIS_URL=redis://localhost:6379/0
+```
 
-Caching template content with Redis for performance
+### Installation
+1. Clone the repository
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Start the services:
+   ```bash
+   # Terminal 1 - User Service
+   uvicorn user_service:app --port 8001
+   
+   # Terminal 2 - Template Service
+   uvicorn template_service:app --port 8002
+   
+   # Terminal 3 - API Gateway
+   uvicorn api_gateway:app --port 8000
+   ```
 
-Enhanced /health checks for database and Redis status
+## 🚦 Testing
+
+Run the test suite:
+```bash
+pytest test_*.py
+```
+
+## 📊 Monitoring
+
+Each service provides health check endpoints:
+- `GET /health` - Service health status
+- `GET /health/db` - Database connection status
+- `GET /health/redis` - Redis connection status
+
+## 📝 Message Queue
+
+The system uses RabbitMQ for asynchronous processing. The following queues are set up:
+- `notifications.email` - For email notifications
+- `notifications.push` - For push notifications
+- `failed.queue` - Dead letter queue for failed messages
+
+## 🔧 Troubleshooting
+
+1. **Message not delivered**
+   - Check RabbitMQ management console
+   - Verify queue consumers are running
+   - Check service logs for errors
+
+2. **Template rendering issues**
+   - Verify template exists in the template service
+   - Check that all required variables are provided
+   - Check Redis cache status
+
+3. **Database connection problems**
+   - Verify database URL in .env
+   - Check if the database is accessible
+   - Review connection pool settings
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🤝 Contributing
+
+Contributions are welcome! Please read our contributing guidelines before submitting pull requests.
 
 🚀 Prerequisites (Local Development)
 
