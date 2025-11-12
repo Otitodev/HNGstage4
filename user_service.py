@@ -4,8 +4,9 @@ import logging
 import sys
 import uuid
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union
 from dotenv import load_dotenv
+# Redis will be imported in startup_event
 
 # Add project root to Python path
 project_root = str(Path(__file__).parent)
@@ -13,11 +14,12 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from utils.response_formatter import success_response, error_response
+from utils.cache import CacheManager, cached, invalidate_cache
 
 # Load environment variables from .env file
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, status, Header
+from fastapi import FastAPI, HTTPException, status, Header, Depends
 from pydantic import BaseModel, Field
 
 # Conditional import for the asynchronous PostgreSQL driver
@@ -36,10 +38,12 @@ logger = logging.getLogger(__name__)
 
 # --- Global State & Configuration ---
 DB_POOL: Optional[asyncpg.Pool] = None
+CACHE_MANAGER: Optional[CacheManager] = None
 
 # Environment Variables
 NEON_DATABASE_URL = os.environ.get("NEON_DATABASE_URL")
 INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET", "super-secret-dev-key")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 # Debug log environment variables (masking sensitive data)
 logger.info(f"NEON_DATABASE_URL loaded: {'*' * 20}{NEON_DATABASE_URL[-10:] if NEON_DATABASE_URL else 'None'}")
@@ -240,6 +244,16 @@ async def create_user_in_db(user_data: dict) -> dict:
             "preferences": user_data["preferences"]
         }
         MOCK_USERS[user_id] = user
+        
+        # Invalidate cache for this user
+        if CACHE_MANAGER:
+            try:
+                # Invalidate both user ID and email caches
+                await CACHE_MANAGER.delete(f"users:{user_id}")
+                await CACHE_MANAGER.delete(f"users:email:{user_data['email_address']}")
+            except Exception as e:
+                logger.warning(f"Cache invalidation failed: {str(e)}")
+            
         return user
         
     if not HAS_DB_DRIVER or not DB_POOL:
@@ -323,20 +337,65 @@ app = FastAPI(
 @app.on_event("startup")
 async def startup_event():
     """
-    Initialize database connection pool on application startup.
+    Initialize database connection pool and cache on application startup.
     """
+    global CACHE_MANAGER
+    
     logger.info("User Service is starting up.")
     await initialize_db()
+    
+    # Initialize Redis cache
+    try:
+        from upstash_redis import Redis as UpstashRedis
+        rest_url = os.getenv('UPSTASH_REDIS_REST_URL')
+        token = os.getenv('UPSTASH_REDIS_REST_TOKEN')
+        
+        if rest_url and token:
+            redis_client = UpstashRedis(url=rest_url, token=token)
+            CACHE_MANAGER = CacheManager(redis_client, key_prefix="user_svc:")
+            logger.info("Redis cache initialized successfully with Upstash")
+        else:
+            logger.warning("Upstash Redis credentials not found, cache disabled")
+            CACHE_MANAGER = None
+    except Exception as e:
+        logger.error(f"Failed to initialize Redis cache: {str(e)}")
+        CACHE_MANAGER = None
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """
-    Close the database connection pool on application shutdown.
+    Clean up resources on application shutdown.
     """
-    global DB_POOL
-    if DB_POOL:
-        logger.info("Closing Neon PostgreSQL connection pool.")
-        await DB_POOL.close()
+    global DB_POOL, CACHE_MANAGER
+    
+    try:
+        # Close database connection pool
+        if DB_POOL:
+            logger.info("Closing Neon PostgreSQL connection pool.")
+            await DB_POOL.close()
+    except Exception as e:
+        logger.error(f"Error closing database connection: {str(e)}")
+    
+    try:
+        # Close Redis connection if using connection pooling
+        if CACHE_MANAGER is not None and hasattr(CACHE_MANAGER, 'redis') and CACHE_MANAGER.redis is not None:
+            if hasattr(CACHE_MANAGER.redis, 'close') and callable(CACHE_MANAGER.redis.close):
+                logger.info("Closing Redis connection.")
+                if asyncio.iscoroutinefunction(CACHE_MANAGER.redis.close):
+                    await CACHE_MANAGER.redis.close()
+                else:
+                    CACHE_MANAGER.redis.close()
+            elif hasattr(CACHE_MANAGER.redis, 'connection_pool') and CACHE_MANAGER.redis.connection_pool is not None:
+                logger.info("Closing Redis connection pool.")
+                if hasattr(CACHE_MANAGER.redis.connection_pool, 'disconnect') and \
+                   callable(CACHE_MANAGER.redis.connection_pool.disconnect):
+                    CACHE_MANAGER.redis.connection_pool.disconnect()
+    except Exception as e:
+        logger.error(f"Error closing Redis connection: {str(e)}")
+    finally:
+        # Ensure we clear the global variables
+        DB_POOL = None
+        CACHE_MANAGER = None
 
 async def get_db_pool() -> asyncpg.Pool:
     """Get or create a database pool"""
@@ -408,10 +467,13 @@ async def health_check():
     status_code=status.HTTP_200_OK,
     summary="Get user profile and preferences"
 )
+@cached(key_func=lambda user_id, **kwargs: f"users:{user_id}", ttl=3600)  # Cache for 1 hour
 async def get_user_profile(
     user_id: str,
     # Require the custom header for service-to-service authentication
-    x_internal_secret: str = Header(..., alias="X-Internal-Secret") 
+    x_internal_secret: str = Header(..., alias="X-Internal-Secret"),
+    # Inject cache manager if available
+    cache: Optional[CacheManager] = Depends(lambda: CACHE_MANAGER)
 ):
     """
     Retrieves the user's profile and preferences. This endpoint is internal 
@@ -429,6 +491,10 @@ async def get_user_profile(
             status_code=status.HTTP_401_UNAUTHORIZED
         )
     
+    # Set cache on the instance for the decorator
+    if not hasattr(get_user_profile, 'cache'):
+        setattr(get_user_profile, 'cache', cache)
+    
     try:
         # Try to get user from database if available
         if HAS_DB_DRIVER and DB_POOL is not None:
@@ -442,6 +508,12 @@ async def get_user_profile(
                 )
             user_data = MOCK_USERS[user_id]
         
+        if not user_data:
+            return error_response(
+                message=f"User with ID '{user_id}' not found.",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+            
         return success_response(
             data=user_data,
             message="User profile retrieved successfully"
@@ -456,18 +528,55 @@ async def get_user_profile(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
+async def create_user_service(user_data: dict, cache: Optional[CacheManager] = None) -> dict:
+    """
+    Service function to create a new user.
+    This can be called directly or from the API endpoint.
+    
+    Args:
+        user_data: Dictionary containing user data
+        cache: Optional cache manager instance
+        
+    Returns:
+        dict: Response containing the created user or error details
+    """
+    try:
+        # Create the user in the database
+        created_user = await create_user_in_db(user_data)
+        
+        # Invalidate cache if cache is available
+        if cache and 'email_address' in user_data:
+            await cache.delete(f"users:{user_data['email_address']}")
+            
+        return {
+            "success": True,
+            "data": created_user,
+            "message": "User created successfully"
+        }
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        error_msg = f"Error creating user: {str(e)}"
+        logger.error(error_msg)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+
 @app.post(
     "/v1/users",
     status_code=status.HTTP_201_CREATED,
     response_model=UserContract,
     summary="Create a new user"
 )
-async def create_user(
+@invalidate_cache("users:{user_data.email_address}")
+async def create_user_endpoint(
     user_data: UserCreate,
-    x_internal_secret: str = Header(..., alias="X-Internal-Secret")
+    x_internal_secret: str = Header(..., alias="X-Internal-Secret"),
+    cache: Optional[CacheManager] = Depends(lambda: CACHE_MANAGER)
 ):
     """
-    Creates a new user with the provided information.
+    API endpoint to create a new user.
     
     This endpoint is internal and requires the 'X-Internal-Secret' header for access control,
     ensuring only the API Gateway can call it.
@@ -475,6 +584,7 @@ async def create_user(
     Returns 201 with the created user data on success.
     Returns 400 for invalid input data.
     Returns 409 if a user with the email already exists.
+    Returns 401 for invalid API secret.
     """
     # Verify the internal secret
     if x_internal_secret != INTERNAL_API_SECRET:
@@ -484,27 +594,21 @@ async def create_user(
             status_code=status.HTTP_401_UNAUTHORIZED
         )
     
+    # Set cache on the instance for the decorator
+    if not hasattr(create_user_endpoint, 'cache'):
+        setattr(create_user_endpoint, 'cache', cache)
+    
     try:
-        # Convert Pydantic model to dict for processing
-        user_dict = user_data.dict()
-        
-        # Create the user in the database
-        created_user = await create_user_in_db(user_dict)
-        
-        return success_response(
-            data=created_user,
-            message="User created successfully",
-            status_code=status.HTTP_201_CREATED
-        )
-        
+        # Convert Pydantic model to dict and call the service
+        result = await create_user_service(user_data.dict(), cache)
+        return result
     except HTTPException as he:
-        # Re-raise HTTP exceptions with the same status code and detail
         return error_response(
-            message=he.detail,
+            message=str(he.detail),
             status_code=he.status_code
         )
     except Exception as e:
-        error_msg = f"Error creating user: {str(e)}"
+        error_msg = f"Unexpected error in create_user_endpoint: {str(e)}"
         logger.error(error_msg)
         return error_response(
             message="Failed to create user",

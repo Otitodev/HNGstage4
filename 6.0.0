@@ -1,7 +1,0 @@
-Requirement already satisfied: sendgrid in c:\users\user\documents\hngstage4\venv\lib\site-packages (6.12.5)
-Requirement already satisfied: python-http-client>=3.2.1 in c:\users\user\documents\hngstage4\venv\lib\site-packages (from sendgrid) (3.3.7)
-Requirement already satisfied: cryptography>=45.0.6 in c:\users\user\documents\hngstage4\venv\lib\site-packages (from sendgrid) (46.0.3)
-Requirement already satisfied: werkzeug>=2.2.0 in c:\users\user\documents\hngstage4\venv\lib\site-packages (from sendgrid) (3.1.3)
-Requirement already satisfied: cffi>=2.0.0 in c:\users\user\documents\hngstage4\venv\lib\site-packages (from cryptography>=45.0.6->sendgrid) (2.0.0)
-Requirement already satisfied: MarkupSafe>=2.1.1 in c:\users\user\documents\hngstage4\venv\lib\site-packages (from werkzeug>=2.2.0->sendgrid) (3.0.3)
-Requirement already satisfied: pycparser in c:\users\user\documents\hngstage4\venv\lib\site-packages (from cffi>=2.0.0->cryptography>=45.0.6->sendgrid) (2.23)

@@ -2,10 +2,23 @@ import os
 import json
 import logging
 import sys
+import uuid
+import time
+import asyncio
+import httpx
+import pika
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Union
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, status, Header, Request, Depends
+from pydantic import BaseModel, Field
+import redis
+from redis import Redis
+
+# Import utilities
 from utils.response_formatter import success_response, error_response
+from utils.retry_utils import retry_with_backoff, MaxRetriesExceededError
+from utils.idempotency import IdempotencyManager, IdempotencyError, IdempotencyKeyMissing, idempotent
 
 # Add project root to Python path
 project_root = str(Path(__file__).parent.parent)
@@ -41,22 +54,122 @@ USER_SERVICE_URL = os.environ.get("USER_SERVICE_URL", "http://localhost:8001")
 TEMPLATE_SERVICE_URL = os.environ.get("TEMPLATE_SERVICE_URL", "http://localhost:8002")
 RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 
-# --- Circuit Breaker Setup (NEW) ---
+# --- Circuit Breaker Setup ---
 
 # Breaker for the User Service: Fails after 5 consecutive connection errors. Resets after 60s.
 user_breaker = pybreaker.CircuitBreaker(
     fail_max=5, 
-    reset_timeout=60, 
-    # Do NOT trip the breaker for expected HTTP errors (like 404), only network/connection failures
+    reset_timeout=60,
     exclude=[requests.exceptions.HTTPError]
 )
 
 # Breaker for the Template Service
 template_breaker = pybreaker.CircuitBreaker(
     fail_max=5, 
-    reset_timeout=60, 
+    reset_timeout=60,
     exclude=[requests.exceptions.HTTPError]
 )
+
+# --- Redis Client Setup ---
+
+# --- Redis Client Setup ---
+def get_redis() -> Redis:
+    """Get Redis client instance."""
+    try:
+        from upstash_redis import Redis as UpstashRedis
+        rest_url = os.getenv('UPSTASH_REDIS_REST_URL')
+        token = os.getenv('UPSTASH_REDIS_REST_TOKEN')
+        
+        if rest_url and token:
+            return UpstashRedis(url=rest_url, token=token)
+        
+        # Fallback to local Redis if Upstash config is not complete
+        import redis
+        return redis.Redis.from_url(
+            'redis://localhost:6379/0',
+            decode_responses=False,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+            retry_on_timeout=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to connect to Redis: {str(e)}")
+        raise
+
+async def health_check(redis: Redis = Depends(get_redis)):
+    """Health check endpoint that verifies all dependencies."""
+    # Check Redis
+    redis_status = "healthy"
+    try:
+        # Check if the Redis client is from upstash_redis (which is synchronous)
+        if hasattr(redis, 'ping'):
+            # Upstash Redis (synchronous)
+            redis.ping()  # This is a synchronous call
+        else:
+            # Standard aioredis/redis-py with async support
+            await redis.ping()
+    except Exception as e:
+        redis_status = f"unhealthy: {str(e)}"
+    
+    # Rest of your health check code remains the same...
+    rabbitmq_status = "healthy"
+    try:
+        params = pika.URLParameters(RABBITMQ_URL)
+        connection = pika.BlockingConnection(params)
+        connection.close()
+    except Exception as e:
+        rabbitmq_status = f"unhealthy: {str(e)}"
+    
+    # Check dependent services
+    services_to_check = [
+        (USER_SERVICE_URL, "user-service"),
+        (TEMPLATE_SERVICE_URL, "template-service")
+    ]
+    
+    service_statuses = await asyncio.gather(
+        *[check_service_health(url, name) for url, name in services_to_check],
+        return_exceptions=True
+    )
+    
+    # Process service statuses...
+    service_statuses = [
+        {
+            "service": name,
+            "status": "unreachable",
+            "error": str(status) if isinstance(status, Exception) else "Unknown error",
+            "response_time_ms": None
+        } if isinstance(status, Exception) else status
+        for status, (_, name) in zip(service_statuses, services_to_check)
+    ]
+    
+    all_healthy = all(
+        s.get("status") == "healthy" 
+        for s in service_statuses
+    ) and redis_status == "healthy" and rabbitmq_status == "healthy"
+    
+    return success_response(
+        data={
+            "status": "healthy" if all_healthy else "degraded",
+            "dependencies": {
+                "redis": redis_status,
+                "rabbitmq": rabbitmq_status,
+                "services": service_statuses
+            }
+        },
+        message="Service status" if all_healthy else "One or more services are unavailable",
+        status_code=status.HTTP_200_OK if all_healthy else status.HTTP_503_SERVICE_UNAVAILABLE
+    )
+
+# Initialize idempotency manager
+idempotency_manager = None
+try:
+    redis_client = get_redis()
+    idempotency_manager = IdempotencyManager(redis_client)
+    logger.info("Idempotency manager initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize idempotency manager: {str(e)}")
+    idempotency_manager = None
 
 # --- Define External API Contract ---
 
@@ -94,15 +207,130 @@ def publish_to_queue(payload: Dict[str, Any], queue_name: str = "notifications")
 
 
 # --- FastAPI Application Setup ---
-app = FastAPI(title="API Gateway (Notification Orchestrator)")
+app = FastAPI(
+    title="API Gateway (Notification Orchestrator)",
+    version="1.0.0",
+    description="Orchestrates notification delivery with retry and idempotency support"
+)
+
+# Add middleware for request/response logging
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    request_id = request.headers.get('X-Request-ID', str(uuid.uuid4()))
+    
+    # Log request
+    logger.info(f"Request: {request.method} {request.url} - RequestID: {request_id}")
+    
+    # Process request
+    response = await call_next(request)
+    
+    # Log response
+    logger.info(f"Response: {request.method} {request.url} - Status: {response.status_code} - RequestID: {request_id}")
+    
+    # Ensure request ID is in response headers
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+# Update the check_service_health function in api_gateway.py
+async def check_service_health(url: str, service_name: str) -> Dict[str, Any]:
+    """Check the health of a dependent service."""
+    try:
+        start_time = time.time()
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{url}/v1/health")
+            response.raise_for_status()
+            data = response.json()
+            
+            # Handle different response formats
+            if service_name == "user-service":
+                service_data = data.get("data", {})
+                status_value = service_data.get("status", "unknown")
+                details = service_data.get("dependencies", {})
+            else:  # template-service
+                service_data = data.get("data", {})
+                status_value = service_data.get("status", "unknown")
+                details = service_data.get("services", {})
+            
+            return {
+                "service": service_name,
+                "status": status_value,
+                "response_time_ms": int((time.time() - start_time) * 1000),
+                "details": details
+            }
+    except Exception as e:
+        return {
+            "service": service_name,
+            "status": "unreachable",
+            "error": str(e),
+            "response_time_ms": None
+        }
 
 # --- Root Endpoint ---
-@app.get("/", include_in_schema=False)
+@app.get("/", include_in_schema=True)
 async def root():
     """Root endpoint to verify the service is running."""
     return success_response(
         data={"service": "API Gateway"},
         message="API Gateway is running"
+    )
+
+@app.get("/health", status_code=200, include_in_schema=True)
+async def health_check(redis: Redis = Depends(get_redis)):
+    """Health check endpoint that verifies all dependencies."""
+    # Check Redis
+    redis_status = "healthy"
+    try:
+        await redis.ping()
+    except Exception as e:
+        redis_status = f"unhealthy: {str(e)}"
+    
+    # Check RabbitMQ
+    rabbitmq_status = "healthy"
+    try:
+        params = pika.URLParameters(RABBITMQ_URL)
+        connection = pika.BlockingConnection(params)
+        connection.close()
+    except Exception as e:
+        rabbitmq_status = f"unhealthy: {str(e)}"
+    
+    # Check dependent services
+    services_to_check = [
+        (USER_SERVICE_URL, "user-service"),
+        (TEMPLATE_SERVICE_URL, "template-service")
+    ]
+    
+    service_statuses = await asyncio.gather(
+        *[check_service_health(url, name) for url, name in services_to_check],
+        return_exceptions=True
+    )
+    
+    # Convert any exceptions to error responses
+    service_statuses = [
+        {
+            "service": name,
+            "status": "unreachable",
+            "error": str(status) if isinstance(status, Exception) else "Unknown error",
+            "response_time_ms": None
+        } if isinstance(status, Exception) else status
+        for status, (_, name) in zip(service_statuses, services_to_check)
+    ]
+    
+    all_healthy = all(
+        s.get("status") == "healthy" 
+        for s in service_statuses
+    ) and redis_status == "healthy" and rabbitmq_status == "healthy"
+    
+    return success_response(
+        data={
+            "status": "healthy" if all_healthy else "degraded",
+            "dependencies": {
+                "redis": redis_status,
+                "rabbitmq": rabbitmq_status,
+                "services": service_statuses
+            }
+        },
+        message="Service status" if all_healthy else "One or more services are unavailable",
+        status_code=status.HTTP_200_OK if all_healthy else status.HTTP_503_SERVICE_UNAVAILABLE
     )
 
 # --- Main Orchestration Endpoint (UPDATED) ---
@@ -129,6 +357,55 @@ def call_user_service(user_id: str, headers: Dict[str, str]) -> Dict[str, Any]:
         "message": "User data retrieved successfully"
     }
 
+# Helper function to create a new user in the User Service
+@user_breaker
+def create_user_in_user_service(user_data: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Create a new user by calling the User Service.
+    
+    Args:
+        user_data: Dictionary containing user data to create
+        headers: Headers to include in the request (must include X-Internal-Secret)
+        
+    Returns:
+        Dictionary containing the created user data or error information
+    """
+    create_user_url = f"{USER_SERVICE_URL}/v1/users"
+    
+    try:
+        response = requests.post(
+            create_user_url,
+            json=user_data,
+            headers=headers,
+            timeout=10
+        )
+        
+        # If successful, return the response data
+        if response.status_code == status.HTTP_201_CREATED:
+            return {
+                "success": True,
+                "data": response.json(),
+                "status_code": response.status_code
+            }
+            
+        # For error responses, include the error details
+        error_data = response.json()
+        return {
+            "success": False,
+            "error": error_data.get("error", "Unknown error"),
+            "message": error_data.get("message", "Failed to create user"),
+            "status_code": response.status_code
+        }
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to create user in user service: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Failed to connect to User Service",
+            "status_code": status.HTTP_503_SERVICE_UNAVAILABLE
+        }
+
 # Helper function to encapsulate Template Service call under the breaker
 @template_breaker
 def call_template_service(payload: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
@@ -142,13 +419,28 @@ def call_template_service(payload: Dict[str, Any], headers: Dict[str, str]) -> D
 @app.post(
     "/v1/notifications", 
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Request a Notification to be Sent"
+    summary="Request a Notification to be Sent",
+    response_model=Dict[str, Any]
 )
-def send_notification(request: NotificationRequest):
+@idempotent(header='X-Idempotency-Key', ttl=86400)
+async def send_notification(
+    request: NotificationRequest,
+    x_idempotency_key: Optional[str] = Header(None, alias='X-Idempotency-Key'),
+    redis: Redis = Depends(get_redis),
+    request_obj: Request = None
+):
     
-    headers = {"X-Internal-Secret": INTERNAL_API_SECRET}
+    headers = {
+        "X-Internal-Secret": INTERNAL_API_SECRET,
+        "X-Request-ID": str(uuid.uuid4()),  # Add request ID for tracing
+        "X-Idempotency-Key": x_idempotency_key or str(uuid.uuid4())
+    }
     user_data = None
     rendered_content = None
+    
+    # Log the incoming request with request ID
+    request_id = headers["X-Request-ID"]
+    logger.info(f"Processing notification request {request_id} for user {request.user_id}")
 
     # --- Step 1: Fetch User Profile and Preferences (Protected) ---
     try:
@@ -272,17 +564,46 @@ def send_notification(request: NotificationRequest):
         )
     
     try:
-        publish_to_queue(final_payload, queue_name="notifications")
+        # Add retry logic with exponential backoff for publishing to queue
+        @retry_with_backoff(
+            max_retries=3,
+            initial_delay=0.1,
+            max_delay=5.0,
+            factor=2.0,
+            jitter=True
+        )
+        def _publish_with_retry():
+            publish_to_queue(final_payload, queue_name="notifications")
+            
+        _publish_with_retry()
+        
+        response_data = {
+            "notification_id": final_payload.get("user_id"),
+            "request_id": request_id,
+            "idempotency_key": x_idempotency_key or "auto-generated"
+        }
+        
+        logger.info(f"Successfully queued notification {request_id}")
         return success_response(
-            data={"notification_id": final_payload.get("user_id")},
+            data=response_data,
             message="Notification successfully queued for delivery.",
             status_code=status.HTTP_202_ACCEPTED
         )
-    except Exception as e:
-        logger.error(f"Failed to publish to queue: {str(e)}")
+        
+    except MaxRetriesExceededError as e:
+        error_msg = f"Failed to publish to queue after multiple retries: {str(e)}"
+        logger.error(f"{error_msg}. Request ID: {request_id}")
         return error_response(
-            message="Failed to queue notification",
-            error=str(e),
+            message="Service temporarily unavailable",
+            error=error_msg,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+    except Exception as e:
+        error_msg = f"Failed to queue notification: {str(e)}"
+        logger.error(f"{error_msg}. Request ID: {request_id}")
+        return error_response(
+            message="Failed to process notification",
+            error=error_msg,
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 

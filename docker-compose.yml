@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  api-gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - INTERNAL_API_SECRET=your-secret-key
+      - USER_SERVICE_URL=http://user-service:8001
+      - TEMPLATE_SERVICE_URL=http://template-service:8002
+      - RABBITMQ_URL=amqp://rabbitmq:5672/
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - user-service
+      - template-service
+      - rabbitmq
+      - redis
+
+  user-service:
+    build: .
+    command: uvicorn user_service:app --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+
+  template-service:
+    build: .
+    command: uvicorn template_service:app --host 0.0.0.0 --port 8002
+    ports:
+      - "8002:8002"
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"  # RabbitMQ Management UI
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  # Optional: Uncomment if running email and push services as separate containers
+  # email-service:
+  #   build: .
+  #   command: python services/email_service.py
+  #   environment:
+  #     - RABBITMQ_URL=amqp://rabbitmq:5672/
+  #     - SENDGRID_API_KEY=your-sendgrid-key
+  #     - FROM_EMAIL=noreply@example.com
+  #   depends_on:
+  #     - rabbitmq
+
+  # push-service:
+  #   build: .
+  #   command: python services/push_service.py
+  #   environment:
+  #     - RABBITMQ_URL=amqp://rabbitmq:5672/
+  #     - FIREBASE_CREDENTIALS_PATH=/app/firebase-credentials.json
+  #   volumes:
+  #     - ./path/to/local/credentials:/app
+  #   depends_on:
+  #     - rabbitmq
+
+volumes:
+  redis_data:
+  rabbitmq_data:
