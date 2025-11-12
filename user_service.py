@@ -249,8 +249,8 @@ async def create_user_in_db(user_data: dict) -> dict:
         if CACHE_MANAGER:
             try:
                 # Invalidate both user ID and email caches
-                await CACHE_MANAGER.delete(f"users:{user_id}")
-                await CACHE_MANAGER.delete(f"users:email:{user_data['email_address']}")
+                CACHE_MANAGER.delete(f"users:{user_id}")
+                CACHE_MANAGER.delete(f"users:email:{user_data['email_address']}")
             except Exception as e:
                 logger.warning(f"Cache invalidation failed: {str(e)}")
             
@@ -467,13 +467,10 @@ async def health_check():
     status_code=status.HTTP_200_OK,
     summary="Get user profile and preferences"
 )
-@cached(key_func=lambda user_id, **kwargs: f"users:{user_id}", ttl=3600)  # Cache for 1 hour
 async def get_user_profile(
     user_id: str,
     # Require the custom header for service-to-service authentication
-    x_internal_secret: str = Header(..., alias="X-Internal-Secret"),
-    # Inject cache manager if available
-    cache: Optional[CacheManager] = Depends(lambda: CACHE_MANAGER)
+    x_internal_secret: str = Header(..., alias="X-Internal-Secret")
 ):
     """
     Retrieves the user's profile and preferences. This endpoint is internal 
@@ -491,9 +488,16 @@ async def get_user_profile(
             status_code=status.HTTP_401_UNAUTHORIZED
         )
     
-    # Set cache on the instance for the decorator
-    if not hasattr(get_user_profile, 'cache'):
-        setattr(get_user_profile, 'cache', cache)
+    # Try to get from cache first
+    cache_key = f"users:{user_id}"
+    if CACHE_MANAGER:
+        cached_user = CACHE_MANAGER.get(cache_key)
+        if cached_user:
+            logger.info(f"Cache hit for user {user_id}")
+            return success_response(
+                data=cached_user,
+                message="User profile retrieved successfully"
+            )
     
     try:
         # Try to get user from database if available
@@ -513,6 +517,10 @@ async def get_user_profile(
                 message=f"User with ID '{user_id}' not found.",
                 status_code=status.HTTP_404_NOT_FOUND
             )
+        
+        # Cache the result
+        if CACHE_MANAGER:
+            CACHE_MANAGER.set(cache_key, user_data, ttl=3600)
             
         return success_response(
             data=user_data,
@@ -546,7 +554,7 @@ async def create_user_service(user_data: dict, cache: Optional[CacheManager] = N
         
         # Invalidate cache if cache is available
         if cache and 'email_address' in user_data:
-            await cache.delete(f"users:{user_data['email_address']}")
+            cache.delete(f"users:{user_data['email_address']}")
             
         return {
             "success": True,
@@ -569,11 +577,9 @@ async def create_user_service(user_data: dict, cache: Optional[CacheManager] = N
     response_model=UserContract,
     summary="Create a new user"
 )
-@invalidate_cache("users:{user_data.email_address}")
 async def create_user_endpoint(
     user_data: UserCreate,
-    x_internal_secret: str = Header(..., alias="X-Internal-Secret"),
-    cache: Optional[CacheManager] = Depends(lambda: CACHE_MANAGER)
+    x_internal_secret: str = Header(..., alias="X-Internal-Secret")
 ):
     """
     API endpoint to create a new user.
@@ -594,14 +600,19 @@ async def create_user_endpoint(
             status_code=status.HTTP_401_UNAUTHORIZED
         )
     
-    # Set cache on the instance for the decorator
-    if not hasattr(create_user_endpoint, 'cache'):
-        setattr(create_user_endpoint, 'cache', cache)
-    
     try:
-        # Convert Pydantic model to dict and call the service
-        result = await create_user_service(user_data.dict(), cache)
-        return result
+        # Create the user in the database
+        created_user = await create_user_in_db(user_data.dict())
+        
+        # Invalidate cache if cache is available
+        if CACHE_MANAGER and user_data.email_address:
+            CACHE_MANAGER.delete(f"users:email:{user_data.email_address}")
+        
+        return success_response(
+            data=created_user,
+            message="User created successfully",
+            status_code=status.HTTP_201_CREATED
+        )
     except HTTPException as he:
         return error_response(
             message=str(he.detail),

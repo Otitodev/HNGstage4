@@ -180,10 +180,10 @@ async def fetch_template_from_db(template_key: str) -> Dict[str, str]:
     
     try:
         # Try to get from cache
-        cached_template = await redis.get(cache_key)
+        cached_template = redis.get(cache_key)
         if cached_template:
             logger.info(f"Cache hit for template: {template_key}")
-            return json.loads(cached_template)
+            return json.loads(cached_template) if isinstance(cached_template, str) else cached_template
     except Exception as e:
         logger.warning(f"Redis cache error (will continue to DB): {e}")
     
@@ -194,7 +194,7 @@ async def fetch_template_from_db(template_key: str) -> Dict[str, str]:
             template = MOCK_TEMPLATES[template_key]
             # Cache the template for future use (1 hour TTL)
             try:
-                await redis.set(cache_key, json.dumps(template), ex=3600)
+                redis.set(cache_key, json.dumps(template), ex=3600)
             except Exception as e:
                 logger.warning(f"Failed to cache template {template_key}: {e}")
             return template
@@ -232,7 +232,7 @@ async def fetch_template_from_db(template_key: str) -> Dict[str, str]:
             template = dict(record)
             # Cache the template for future use (1 hour TTL)
             try:
-                await redis.set(cache_key, json.dumps(template), ex=3600)
+                redis.set(cache_key, json.dumps(template), ex=3600)
             except Exception as e:
                 logger.warning(f"Failed to cache template {template_key}: {e}")
                 
@@ -277,7 +277,7 @@ async def add_template_to_db(template_key: str, data: Dict[str, str]):
     redis = get_redis_client()
     cache_key = f"template:{template_key}"
     try:
-        await redis.delete(cache_key)
+        redis.delete(cache_key)
     except Exception as e:
         logger.warning(f"Failed to invalidate cache for {template_key}: {e}")
     if IS_MOCK_MODE:
@@ -624,7 +624,7 @@ async def create_template(
         redis = get_redis_client()
         cache_key = f"template:{request.template_key}"
         try:
-            await redis.delete(cache_key)
+            redis.delete(cache_key)
         except Exception as e:
             logger.warning(f"Failed to invalidate cache for {request.template_key}: {e}")
         

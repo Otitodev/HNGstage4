@@ -27,8 +27,8 @@ class RedisClient:
         # Initialize Upstash Redis client
         self._client = Redis(url=redis_url, token=redis_token)
     
-    async def get(self, key: str) -> Optional[Any]:
-        """Get a value from Redis."""
+    def get(self, key: str) -> Optional[Any]:
+        """Get a value from Redis (synchronous)."""
         try:
             value = self._client.get(key)
             if value is not None:
@@ -41,8 +41,8 @@ class RedisClient:
             print(f"Redis get error: {e}")
             return None
     
-    async def set(self, key: str, value: Any, ex: Optional[int] = None) -> bool:
-        """Set a value in Redis with optional expiration."""
+    def set(self, key: str, value: Any, ex: Optional[int] = None) -> bool:
+        """Set a value in Redis with optional expiration (synchronous)."""
         try:
             serialized_value = json.dumps(value)
             if ex:
@@ -54,26 +54,26 @@ class RedisClient:
             print(f"Redis set error: {e}")
             return False
     
-    async def delete(self, *keys) -> int:
-        """Delete one or more keys from Redis."""
+    def delete(self, *keys) -> int:
+        """Delete one or more keys from Redis (synchronous)."""
         try:
             return self._client.delete(*keys)
         except Exception as e:
             print(f"Redis delete error: {e}")
             return 0
     
-    async def exists(self, key: str) -> bool:
-        """Check if a key exists in Redis."""
+    def exists(self, key: str) -> bool:
+        """Check if a key exists in Redis (synchronous)."""
         try:
             return bool(self._client.exists(key))
         except Exception as e:
             print(f"Redis exists error: {e}")
             return False
     
-    async def ping(self) -> bool:
-        """Ping the Redis server."""
+    def ping(self) -> bool:
+        """Ping the Redis server (synchronous)."""
         try:
-            return await self._client.ping()
+            return self._client.ping()
         except Exception as e:
             print(f"Redis ping error: {e}")
             return False

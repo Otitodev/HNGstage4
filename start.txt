@@ -1,5 +1,5 @@
-uvicorn user_service:app --reload --port 8002
+uvicorn user_service:app --reload --port 8001
 
-uvicorn template_service:app --reload --port 8001
+uvicorn template_service:app --reload --port 8002
 
-uvicorn api_gateway:app --port 8000 --reload
+uvicorn api_gateway:app --reload --port 8000 
