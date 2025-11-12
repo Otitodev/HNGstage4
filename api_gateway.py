@@ -103,12 +103,16 @@ async def health_check(redis: Redis = Depends(get_redis)):
     redis_status = "healthy"
     try:
         # Check if the Redis client is from upstash_redis (which is synchronous)
-        if hasattr(redis, 'ping'):
+        if hasattr(redis, '_client'):
             # Upstash Redis (synchronous)
-            redis.ping()  # This is a synchronous call
+            result = redis.ping()
+            if result != "PONG":
+                raise ValueError(f"Unexpected ping response: {result}")
         else:
-            # Standard aioredis/redis-py with async support
-            await redis.ping()
+            # Standard redis-py with async support
+            result = await redis.ping()
+            if not result:
+                raise ValueError("Redis ping failed")
     except Exception as e:
         redis_status = f"unhealthy: {str(e)}"
     
@@ -275,12 +279,22 @@ async def root():
     )
 
 @app.get("/health", status_code=200, include_in_schema=True)
-async def health_check(redis: Redis = Depends(get_redis)):
+async def health_check_endpoint(redis: Redis = Depends(get_redis)):
     """Health check endpoint that verifies all dependencies."""
     # Check Redis
     redis_status = "healthy"
     try:
-        await redis.ping()
+        # Check if the Redis client is from upstash_redis (which is synchronous)
+        if hasattr(redis, '_client'):
+            # Upstash Redis (synchronous)
+            result = redis.ping()
+            if result != "PONG":
+                raise ValueError(f"Unexpected ping response: {result}")
+        else:
+            # Standard redis-py with async support
+            result = await redis.ping()
+            if not result:
+                raise ValueError("Redis ping failed")
     except Exception as e:
         redis_status = f"unhealthy: {str(e)}"
     
@@ -422,12 +436,9 @@ def call_template_service(payload: Dict[str, Any], headers: Dict[str, str]) -> D
     summary="Request a Notification to be Sent",
     response_model=Dict[str, Any]
 )
-@idempotent(header='X-Idempotency-Key', ttl=86400)
 async def send_notification(
     request: NotificationRequest,
-    x_idempotency_key: Optional[str] = Header(None, alias='X-Idempotency-Key'),
-    redis: Redis = Depends(get_redis),
-    request_obj: Request = None
+    x_idempotency_key: Optional[str] = Header(None, alias='X-Idempotency-Key')
 ):
     
     headers = {
@@ -441,6 +452,13 @@ async def send_notification(
     # Log the incoming request with request ID
     request_id = headers["X-Request-ID"]
     logger.info(f"Processing notification request {request_id} for user {request.user_id}")
+    
+    # Handle idempotency manually
+    if x_idempotency_key and idempotency_manager:
+        cached_response = idempotency_manager.check_duplicate(x_idempotency_key)
+        if cached_response:
+            logger.info(f"Returning cached response for idempotency key: {x_idempotency_key}")
+            return cached_response
 
     # --- Step 1: Fetch User Profile and Preferences (Protected) ---
     try:
@@ -582,6 +600,13 @@ async def send_notification(
             "request_id": request_id,
             "idempotency_key": x_idempotency_key or "auto-generated"
         }
+        
+        # Store response for idempotency
+        if x_idempotency_key and idempotency_manager:
+            try:
+                idempotency_manager.store_response(x_idempotency_key, response_data)
+            except Exception as e:
+                logger.warning(f"Failed to store idempotency response: {str(e)}")
         
         logger.info(f"Successfully queued notification {request_id}")
         return success_response(

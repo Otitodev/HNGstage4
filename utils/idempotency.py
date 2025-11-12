@@ -18,9 +18,13 @@ class IdempotencyKeyMissing(IdempotencyError):
     """Raised when idempotency key is missing."""
     pass
 
-def generate_request_id(*args: Any) -> str:
+def generate_request_id(*args: Any, **kwargs: Any) -> str:
     """Generate a unique request ID from the given arguments."""
-    return hashlib.sha256(str(args).encode()).hexdigest()
+    # Combine args and kwargs for hashing, excluding certain keys
+    excluded_keys = {'redis', 'request', 'x_idempotency_key', 'request_obj'}
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k not in excluded_keys}
+    combined = str((args, filtered_kwargs))
+    return hashlib.sha256(combined.encode()).hexdigest()
 
 class IdempotencyManager:
     """Manages idempotency using Redis as a backend."""
