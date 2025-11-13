@@ -54,6 +54,9 @@ Thumbs.db
 data/
 *.db
 *.sqlite3
+*.kiro*
 
 #tests
 *test*
+*start*
+*codebase*
