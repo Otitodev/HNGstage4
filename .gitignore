@@ -1,3 +1,17 @@
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Secrets and Credentials
+*.pem
+*.key
+*.crt
+firebase-credentials.json
+aws secrets.txt
+trust-policy.json
+secrets-policy.json
+
 # Python
 __pycache__/
 *.py[cod]
@@ -19,56 +33,53 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# Virtual Environment
+MANIFEST
 venv/
-env/
 ENV/
+env/
 
-# IDE
-.idea/
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# IDEs
 .vscode/
+.idea/
 *.swp
 *.swo
 *~
-
-# Testing
-.coverage
-htmlcov/
-.pytest_cache/
-.tox/
-.nox/
-
-# Environment variables
-.env
-.env.local
+.DS_Store
 
 # Logs
 *.log
+logs/
 
-# Local development
-.DS_Store
-Thumbs.db
-
-# Project specific
-data/
+# Database
 *.db
+*.sqlite
 *.sqlite3
-*.kiro*
 
-#tests
-*test*
-*start*
-*codbase*
+# Docker
+docker-compose.override.yml
+
+# AWS
+.aws/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+temp/
+tmp/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# specific
 *task*
-*policy*
-*.ps1
-*.sh
-*init*
-*deploy*
-*ockerfile.push
-*ockerfile.email
-*ockerfile.router
-*b_schema*
-*aws_ser*
-*check_email*
+*port*
+*kiro*
