@@ -1,67 +1,189 @@
-# Notification System Microservices
+# Notification System
 
-A distributed notification system designed for resilience and scalability, built with FastAPI, Redis, and RabbitMQ. This system is composed of three core microservices that handle orchestration, user data, and dynamic content rendering.
+A production-ready, distributed notification system with email delivery, template rendering, and comprehensive logging.
 
-## 🚀 Features
+## 🏗️ Architecture
 
-- **Resilient Architecture**: Circuit breakers, retries, and dead-letter queues
-- **High Performance**: Redis caching and async database operations
-- **Scalable**: Microservices architecture with message queuing
-- **Developer Friendly**: Well-documented REST APIs with OpenAPI documentation
-- **Observable**: Comprehensive logging and health checks
+```
+API Gateway (Leapcell) → RabbitMQ (Railway) → Notification Router (AWS ECS)
+                                                      ↓
+                                              ┌───────┴────────┐
+                                              ↓                ↓
+                                        Email Service    Push Service
+                                        (AWS ECS)        (AWS ECS)
+                                              ↓
+                                        PostgreSQL (Neon)
+```
 
-## 📦 Services Overview
+## 🚀 Services
 
-### 1. API Gateway (`api_gateway.py`)
+### 1. API Gateway (`api_gateway.py`) - Leapcell
+**Main orchestration service** - Entry point for all notification requests
 
-The main entry point that orchestrates the notification flow, handling request validation, service coordination, and message queuing.
-
-**Key Features:**
+**Features:**
 - Request validation and routing
 - Circuit breaker pattern for fault tolerance
-- Message queue integration (RabbitMQ)
-- Service discovery and load balancing
-- Synchronous and asynchronous processing
+- Idempotency support
+- RabbitMQ message publishing
+- Service coordination (User + Template services)
 
-### 2. User Service (`user_service.py`)
+**Endpoints:**
+- `POST /v1/notifications` - Send notification
+- `GET /v1/health` - Health check
 
-Manages user data and notification preferences with PostgreSQL database integration.
+### 2. User Service (`user_service.py`) - Leapcell
+**User management and preferences**
 
-**Key Features:**
+**Features:**
 - User profile management
-- Notification preferences
+- Notification preferences (email, push, quiet hours)
 - Multi-language support
-- Database connection pooling
-- Health monitoring
-
-### 3. Template Service (`template_service.py`)
-
-Handles template storage, versioning, and dynamic content rendering.
-
-**Key Features:**
-- Template management (CRUD)
-- Dynamic content rendering
+- PostgreSQL database integration
 - Redis caching
+
+**Endpoints:**
+- `GET /v1/users/{user_id}` - Get user profile
+- `POST /v1/users` - Create user
+- `GET /v1/health` - Health check
+
+### 3. Template Service (`template_service.py`) - Leapcell
+**Template management and rendering**
+
+**Features:**
+- Template CRUD operations
+- Dynamic content rendering with variables
 - Template versioning
-- Health monitoring
+- Redis caching
+- Support for subject, body, and HTML templates
 
-## 📚 API Endpoints
+**Endpoints:**
+- `POST /v1/templates` - Create template
+- `POST /v1/templates/render` - Render template with data
+- `GET /v1/templates/{template_key}` - Get template
+- `GET /v1/health` - Health check
 
-### API Gateway
-- `POST /notify` - Send a notification
-  ```json
-  {
-    "user_id": "uuid-here",
-    "template_key": "WELCOME_EMAIL",
-    "message_data": {"name": "John", "verification_link": "https://..."}
-  }
-  ```
+### 4. Email Service (`services/email_service.py`) - AWS ECS
+**Email delivery with SendGrid integration**
 
-### User Service
-- `GET /users/{user_id}` - Get user profile
-- `POST /users` - Create new user
-  ```json
-  {
+**Features:**
+- SendGrid email delivery
+- Automatic retry (up to 5 attempts)
+- PostgreSQL logging for analytics
+- Dead letter queue for permanent failures
+- Consumes from `email.queue`
+
+**Monitoring:**
+- CloudWatch logs
+- Database analytics
+- Delivery tracking
+
+### 5. Push Service (`services/push_service.py`) - AWS ECS
+**Push notification delivery with Firebase**
+
+**Features:**
+- Firebase Cloud Messaging integration
+- Automatic retry logic
+- Dead letter queue support
+- Consumes from `push.queue`
+- Simulation mode (without Firebase credentials)
+
+**Monitoring:**
+- CloudWatch logs
+- Delivery tracking
+
+### Supporting Service
+**Notification Router** (`services/notification_router.py`) - AWS ECS
+- Routes messages from `notifications` queue to `email.queue` and `push.queue`
+- Extracts rendered content from template service response
+- Separates concerns for better tracking
+
+## ✨ Features
+
+- ✅ Multi-channel notifications (Email, Push)
+- ✅ Dynamic template rendering
+- ✅ Automatic retry (up to 5 attempts)
+- ✅ Dead letter queue for failed messages
+- ✅ Database logging for analytics
+- ✅ Idempotency support
+- ✅ Circuit breaker pattern
+- ✅ Redis caching
+- ✅ CloudWatch logging
+
+## 📋 Prerequisites
+
+- Python 3.11+
+- Docker Desktop (for local testing)
+- AWS Account (for production deployment)
+- SendGrid Account
+- Neon PostgreSQL Database
+- RabbitMQ (Railway/CloudAMQP)
+
+## 🚀 Quick Start
+
+### 1. Clone and Install
+
+```bash
+git clone <repository-url>
+cd HNGstage4
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 2. Configure Environment
+
+Create `.env` file:
+
+```env
+# RabbitMQ
+RABBITMQ_URL=amqp://user:pass@host:5672/
+
+# SendGrid
+SENDGRID_API_KEY=SG.your_key_here
+FROM_EMAIL=noreply@yourdomain.com
+
+# Database
+NEON_DATABASE_URL=postgresql://user:pass@host/db?sslmode=require
+
+# Redis
+UPSTASH_REDIS_REST_URL=https://your-redis.upstash.io
+UPSTASH_REDIS_REST_TOKEN=your_token
+
+# Services
+USER_SERVICE_URL=http://localhost:8002
+TEMPLATE_SERVICE_URL=http://localhost:8001
+```
+
+### 3. Initialize Database
+
+```bash
+python services/init_database.py
+```
+
+### 4. Run Services Locally
+
+```bash
+# Terminal 1 - Start RabbitMQ
+docker-compose up rabbitmq -d
+
+# Terminal 2 - Notification Router
+python services/notification_router.py
+
+# Terminal 3 - Email Service
+python services/email_service.py
+
+# Terminal 4 - API Gateway (if testing locally)
+uvicorn api_gateway:app --port 8000
+```
+
+## 📡 API Usage
+
+### 1. Create a User
+
+```bash
+curl -X POST https://your-user-service.leapcell.dev/v1/users \
+  -H "Content-Type: application/json" \
+  -d '{
     "email_address": "user@example.com",
     "phone_number": "+1234567890",
     "preferred_language": "en-US",
@@ -71,258 +193,234 @@ Handles template storage, versioning, and dynamic content rendering.
       "quiet_hours_start": "22:00",
       "quiet_hours_end": "08:00"
     }
-  }
-  ```
-
-### Template Service
-- `POST /templates` - Create new template
-  ```json
-  {
-    "template_key": "WELCOME_EMAIL",
-    "subject": "Welcome, {name}!",
-    "body": "Hello {name}, welcome to our service!",
-    "html_body": "<h1>Welcome, {name}!</h1><p>Thank you for joining us!</p>"
-  }
-  ```
-- `POST /templates/render` - Render template with data
-  ```json
-  {
-    "template_key": "WELCOME_EMAIL",
-    "message_data": {"name": "John"}
-  }
-  ```
-
-## 🛠️ Setup & Installation
-
-### Prerequisites
-- Python 3.8+
-- RabbitMQ
-- Redis
-- PostgreSQL (Neon)
-
-### Environment Variables
-Create a `.env` file with the following variables:
-```
-# API Gateway
-INTERNAL_API_SECRET=your-secret-key
-USER_SERVICE_URL=http://localhost:8001
-TEMPLATE_SERVICE_URL=http://localhost:8002
-RABBITMQ_URL=amqp://guest:guest@localhost:5672/
-
-# User Service
-NEON_DATABASE_URL=postgresql://user:pass@host/db
-
-# Template Service
-REDIS_URL=redis://localhost:6379/0
+  }'
 ```
 
-### Installation
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Start the services:
-   ```bash
-   # Terminal 1 - User Service
-   uvicorn user_service:app --port 8001
-   
-   # Terminal 2 - Template Service
-   uvicorn template_service:app --port 8002
-   
-   # Terminal 3 - API Gateway
-   uvicorn api_gateway:app --port 8000
-   ```
+### 2. Create a Template
 
-## 🚦 Testing
-
-Run the test suite:
 ```bash
-pytest test_*.py
+curl -X POST https://your-template-service.leapcell.dev/v1/templates \
+  -H "Content-Type: application/json" \
+  -d '{
+    "template_key": "WEEKLY_DIGEST",
+    "subject": "Your Weekly {app_name} Digest: {new_updates} new items!",
+    "body": "Check out your latest activity. See summary: {digest_link}",
+    "html_body": "<h3>Weekly Summary</h3><p>You have {new_updates} new items. <a href=\"{digest_link}\">View Digest</a></p>"
+  }'
 ```
+
+### 3. Send Notification
+
+```bash
+curl -X POST https://your-api-gateway.leapcell.dev/v1/notifications \
+  -H "Content-Type: application/json" \
+  -H "X-Idempotency-Key: unique-key-123" \
+  -d '{
+    "user_id": "user-uuid",
+    "template_key": "WEEKLY_DIGEST",
+    "message_data": {
+      "app_name": "MyApp",
+      "new_updates": "10",
+      "digest_link": "https://example.com/digest"
+    }
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "notification_id": "user-uuid",
+    "request_id": "req-uuid",
+    "idempotency_key": "unique-key-123"
+  },
+  "message": "Notification successfully queued for delivery."
+}
+```
+
+### Complete Flow
+
+1. **API Gateway** receives request → validates → fetches user data → renders template
+2. **Publishes** to RabbitMQ `notifications` queue
+3. **Notification Router** (AWS) routes to `email.queue` and `push.queue`
+4. **Email Service** (AWS) sends via SendGrid → logs to database
+5. **Push Service** (AWS) sends via Firebase
+6. **User** receives notification!
+
+## 🔧 Local Testing
+
+See [LOCAL_TESTING_GUIDE.md](LOCAL_TESTING_GUIDE.md) for detailed instructions.
+
+Quick test:
+
+```bash
+# 1. Start RabbitMQ
+docker-compose up rabbitmq -d
+
+# 2. Run test script
+python test_services_local.py
+
+# 3. Start services and monitor logs
+```
+
+## ☁️ AWS Deployment
+
+### Quick Deploy
+
+```powershell
+# 1. Navigate to services folder
+cd services
+
+# 2. Run deployment script
+.\deploy_to_aws.ps1
+
+# 3. Follow the prompts
+```
+
+### Manage Services
+
+```powershell
+# Pause services (stop charges)
+aws ecs update-service --cluster notification-services --service email-service --desired-count 0 --region eu-north-1 --profile otito2
+
+# Resume services
+aws ecs update-service --cluster notification-services --service email-service --desired-count 1 --region eu-north-1 --profile otito2
+```
+
+See [AWS_SERVICE_CONTROL.md](services/AWS_SERVICE_CONTROL.md) for complete guide.
 
 ## 📊 Monitoring
 
-Each service provides health check endpoints:
-- `GET /health` - Service health status
-- `GET /health/db` - Database connection status
-- `GET /health/redis` - Redis connection status
+### Check Email Logs
 
-## 📝 Message Queue
+```bash
+python services/check_email_logs.py
+```
 
-The system uses RabbitMQ for asynchronous processing. The following queues are set up:
-- `notifications.email` - For email notifications
-- `notifications.push` - For push notifications
-- `failed.queue` - Dead letter queue for failed messages
+### CloudWatch Logs
 
-## 🔧 Troubleshooting
+```powershell
+# Email service logs
+aws logs tail /ecs/email-service --follow --region eu-north-1 --profile otito2
 
-1. **Message not delivered**
-   - Check RabbitMQ management console
-   - Verify queue consumers are running
-   - Check service logs for errors
+# Notification router logs
+aws logs tail /ecs/notification-router --follow --region eu-north-1 --profile otito2
+```
 
-2. **Template rendering issues**
-   - Verify template exists in the template service
-   - Check that all required variables are provided
-   - Check Redis cache status
+### Service Status
 
-3. **Database connection problems**
-   - Verify database URL in .env
-   - Check if the database is accessible
-   - Review connection pool settings
+```powershell
+aws ecs describe-services --cluster notification-services --services notification-router email-service --region eu-north-1 --profile otito2
+```
 
-## 📄 License
+## 📁 Project Structure
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+```
+HNGstage4/
+├── services/
+│   ├── email_service.py           # Email delivery service
+│   ├── push_service.py            # Push notification service
+│   ├── notification_router.py     # Message routing service
+│   ├── init_database.py           # Database setup
+│   ├── check_email_logs.py        # View email logs
+│   ├── Dockerfile.email           # Email service container
+│   ├── Dockerfile.router          # Router container
+│   ├── deploy_to_aws.ps1          # AWS deployment script
+│   └── AWS_SERVICE_CONTROL.md     # Service management guide
+├── api_gateway.py                 # Main API gateway
+├── template_service.py            # Template management
+├── user_service.py                # User management
+├── .env                           # Environment variables
+├── requirements.txt               # Python dependencies
+└── README.md                      # This file
+```
+
+## 📚 Documentation
+
+- [Email Service Documentation](services/EMAIL_SERVICE_DOCUMENTATION.md)
+- [Push Service Documentation](services/PUSH_SERVICE_DOCUMENTATION.md)
+- [Template Documentation](TEMPLATES_DOCUMENTATION.md)
+- [AWS Deployment Guide](AWS_DEPLOYMENT_COMPLETE.md)
+- [AWS Service Control](services/AWS_SERVICE_CONTROL.md)
+- [Local Testing Guide](LOCAL_TESTING_GUIDE.md)
+- [Windows Deployment](services/WINDOWS_DEPLOYMENT.md)
+
+## 💰 Cost Breakdown
+
+### AWS ECS (Production)
+- Notification Router: ~$31/month
+- Email Service: ~$31/month
+- **Total: ~$62/month** (when running)
+- **$0/month** when paused (desired count = 0)
+
+### Other Services
+- Leapcell (API Gateway): Free tier
+- RabbitMQ (Railway): Free tier / $5/month
+- PostgreSQL (Neon): Free tier
+- SendGrid: Free tier (100 emails/day)
+
+## 🔒 Security
+
+- API keys stored in AWS Secrets Manager
+- Environment variables never committed
+- IAM roles with least privilege
+- SSL/TLS for all connections
+- Idempotency keys for duplicate prevention
+
+## 🧪 Testing
+
+```bash
+# Run all tests
+pytest
+
+# Test specific service
+pytest test_user_service.py
+
+# Test with coverage
+pytest --cov=. --cov-report=html
+```
+
+## 🐛 Troubleshooting
+
+### Services won't start
+- Check Docker Desktop is running
+- Verify RabbitMQ is accessible
+- Check environment variables in `.env`
+
+### Emails not sending
+- Verify SendGrid API key
+- Check sender email is verified
+- Review CloudWatch logs for errors
+
+### Database connection issues
+- Verify Neon database URL
+- Check SSL mode is set to `require`
+- Test connection with `psql`
+
+See [Troubleshooting Guide](services/AWS_SERVICE_CONTROL.md#troubleshooting) for more.
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please read our contributing guidelines before submitting pull requests.
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests
+5. Submit a pull request
 
-🚀 Prerequisites (Local Development)
+## 📄 License
 
-Python 3.8+
+MIT License - see [LICENSE](LICENSE) file for details.
 
-Redis Server (e.g., via Upstash or local Docker)
+## 🙏 Acknowledgments
 
-RabbitMQ Server (e.g., via Render or local Docker)
+- FastAPI for the excellent web framework
+- SendGrid for email delivery
+- AWS for reliable infrastructure
+- Neon for serverless PostgreSQL
 
-PostgreSQL (e.g., via Neon or local Docker)
+---
 
-pip (Python package manager)
+**Built with ❤️ for reliable, scalable notifications**
 
-🔧 Installation
-
-Clone the repository:
-
-git clone <repository-url>
-cd HNGstage4
-
-
-Create and activate a virtual environment:
-
-python -m venv venv
-# On Unix or MacOS:
-source venv/bin/activate
-
-
-Install dependencies:
-
-pip install -r requirements.txt
-
-
-Set up environment variables:
-Create a .env file in the root directory. Note the use of separate REDIS_HOST and REDIS_PORT.
-
-# API Gateway Security
-INTERNAL_API_SECRET=your-super-secret-key-change-this
-
-# Redis (Upstash) Configuration
-REDIS_HOST=localhost 
-REDIS_PORT=6379 
-
-# RabbitMQ (Render) Configuration
-RABBITMQ_URL=amqp://guest:guest@localhost:5672/
-
-# Service Discovery URLs (Change to Leapcell/Render internal domains in production)
-USER_SERVICE_URL=http://localhost:8001
-TEMPLATE_SERVICE_URL=http://localhost:8002
-
-# Database (Neon) Configuration - Used by User and Template Services
-NEON_DATABASE_URL=postgresql://user:password@localhost:5432/yourdb
-
-
-🏃‍♂️ Running the Services (Local)
-
-1. Start External Dependencies
-
-Start your local PostgreSQL, Redis, and RabbitMQ containers/servers.
-
-2. Start the Services
-
-API Gateway (Port 8000)
-
-uvicorn api_gateway:app --port 8000 --reload
-
-
-User Service (Port 8001)
-
-uvicorn USER.user_service:app --port 8001 --reload
-
-
-Template Service (Port 8002)
-
-uvicorn TEMPLATE.template_service:app --port 8002 --reload
-
-
-🌐 API Endpoints & Standards
-
-System-Wide API Standard
-
-All synchronous API responses across the Gateway, User, and Template services adhere to this uniform structure to ensure consistency and facilitate automated consumption.
-
-{
-  "success": boolean,
-  "data"?: T,
-  "error"?: string,
-  "message": string,
-  "meta": {
-    "total": number,
-    "limit": number,
-    "page": number,
-    "total_pages": number,
-    "has_next": boolean,
-    "has_previous": boolean
-  }
-}
-
-
-API Gateway Endpoints
-
-POST /v1/notifications - Send a notification request, which is queued for async processing.
-
-GET /v1/health - Health check (confirms dependencies are running).
-
-User Service Endpoints
-
-GET /v1/users/{user_id} - Get user profile and preferences.
-
-GET /v1/health - Enhanced health check (DB/Redis status).
-
-Template Service Endpoints
-
-POST /v1/templates/render - Render a template with dynamic data.
-
-POST /v1/templates - Create a new template.
-
-GET /v1/health - Enhanced health check (DB/Redis status).
-
-🔄 Dependencies
-
-FastAPI - High-performance web framework
-
-Pydantic - Data validation
-
-pybreaker - Circuit breaker implementation (Crucial for API Gateway resilience)
-
-pika - RabbitMQ client for publishing messages
-
-redis - Redis client (Used for caching and Idempotency checks)
-
-asyncpg - Async PostgreSQL client (Database connection to Neon)
-
-python-dotenv - Environment variable management
-
-requests - Synchronous HTTP client (API Gateway for internal communication)
-
-🧪 Testing
-
-Run the test suite:
-
-pytest
-
-
-📝 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+For questions or issues, please open a GitHub issue.

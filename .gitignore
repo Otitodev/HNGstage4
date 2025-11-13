@@ -59,4 +59,16 @@ data/
 #tests
 *test*
 *start*
-*codebase*
+*codbase*
+*task*
+*policy*
+*.ps1
+*.sh
+*init*
+*deploy*
+*ockerfile.push
+*ockerfile.email
+*ockerfile.router
+*b_schema*
+*aws_ser*
+*check_email*

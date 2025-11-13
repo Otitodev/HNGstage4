@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  email-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.email
+    environment:
+      - RABBITMQ_URL=${RABBITMQ_URL}
+      - SENDGRID_API_KEY=${SENDGRID_API_KEY}
+      - FROM_EMAIL=${FROM_EMAIL}
+    restart: unless-stopped
+    networks:
+      - notification-network
+
+  push-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.push
+    environment:
+      - RABBITMQ_URL=${RABBITMQ_URL}
+      - FIREBASE_CREDENTIALS_PATH=${FIREBASE_CREDENTIALS_PATH}
+    restart: unless-stopped
+    networks:
+      - notification-network
+
+networks:
+  notification-network:
+    driver: bridge
